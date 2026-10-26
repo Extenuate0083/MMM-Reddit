@@ -14,6 +14,12 @@ Project ETA completion: holiday 2020
 
 Just an installation of [Magic Mirror<sup>2</sup>](https://github.com/MichMich/MagicMirror) and a working internet connection.
 
+## Reddit API Access ##
+
+Reddit now rejects most anonymous requests to its JSON listings. The module still tries the JSON listing first, and if that is refused it falls back to the subreddit's public RSS feed. The RSS feed only carries titles, authors, subreddits and thumbnails, so scores, comment counts and gilding are blank in that case; set `showScore: false` and `showNumComments: false` to hide them.
+
+Reddit also rate limits aggressively, so keep `updateInterval` at 15 minutes or more.
+
 ## Installation ##
 
 1. Run `git clone https://github.com/kjb085/MMM-Reddit.git` in the directory `~/MagicMirror/modules`

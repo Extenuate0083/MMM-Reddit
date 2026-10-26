@@ -3,7 +3,8 @@
  *
  * By kjb085 https://github.com/kjb085/MMM-Reddit
  */
-const request = require('request');
+const https = require('https');
+const urlLib = require('url');
 const NodeHelper = require('node_helper');
 
 module.exports = NodeHelper.create({
@@ -53,50 +54,167 @@ module.exports = NodeHelper.create({
     },
 
     /**
-     * Make request to reddit and send posts back to MM frontend
+     * Identify ourselves to reddit; requests without a User-Agent are rejected
+     * @type {String}
+     */
+    userAgent: 'MagicMirror:MMM-Reddit:1.1 (self-hosted smart mirror)',
+
+    /**
+     * GET a URL and resolve with {statusCode, body}, following redirects
+     *
+     * @param  {String} url
+     * @param  {Number} redirects
+     * @return {Promise}
+     */
+    fetch (url, redirects = 3) {
+        return new Promise((resolve, reject) => {
+            let options = Object.assign(urlLib.parse(url), { headers: { 'User-Agent': this.userAgent } });
+
+            https.get(options, (response) => {
+                let body = '';
+
+                if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location && redirects > 0) {
+                    response.resume();
+                    resolve(this.fetch(urlLib.resolve(url, response.headers.location), redirects - 1));
+                    return;
+                }
+
+                response.setEncoding('utf8');
+                response.on('data', (chunk) => { body += chunk; });
+                response.on('end', () => resolve({ statusCode: response.statusCode, body: body }));
+            }).on('error', reject);
+        });
+    },
+
+    /**
+     * Make request to reddit and send posts back to MM frontend.
+     * Tries the JSON listing first; reddit now blocks most anonymous JSON
+     * requests, so fall back to the public RSS feed.
      *
      * @return {void}
      */
-    getData () {
+    async getData () {
         let url = this.getUrl(this.config),
-            posts = [],
-            body;
+            response;
 
-        request({ url: url }, (error, response, body) => {
+        try {
+            response = await this.fetch(url);
+
             if (response.statusCode === 200) {
-                body = JSON.parse(body);
-                if (typeof body.data !== "undefined") {
-                    if (typeof body.data.children !== "undefined") {
-                        body.data.children.forEach((post) => {
-                            let temp = {};
+                this.handleJson(JSON.parse(response.body));
+                return;
+            }
 
-                            temp.title = this.formatTitle(post.data.title);
-                            temp.score = post.data.score;
-                            temp.thumbnail = post.data.thumbnail;
-                            temp.src = this.getImageUrl(post.data.preview, post.data.thumbnail),
-                            temp.gilded = post.data.gilded;
-                            temp.num_comments = post.data.num_comments;
-                            temp.subreddit = post.data.subreddit;
-                            temp.author = post.data.author;
+            response = await this.fetch(url.replace('/.json?raw_json=1&', '/.rss?'));
 
-                            // Skip image posts that do not have images
-                            if (this.config.displayType !== 'image' || temp.src !== null) {
-                                posts.push(temp);
-                            }
-                        });
+            if (response.statusCode === 200) {
+                this.handleRss(response.body);
+                return;
+            }
 
-                        this.sendData({posts: posts});
-                    } else {
-                        this.sendError('No posts returned. Ensure the subreddit name is spelled correctly. ' +
-                            'Private subreddits are also inaccessible');
-                    }
-                } else {
-                    this.sendError(['Invalid response body', body]);
-                }
-            } else {
-                this.sendError('Request status code: ' + response.statusCode);
+            this.sendError('Request status code: ' + response.statusCode);
+        } catch (error) {
+            this.sendError('Request failed: ' + error.message);
+        }
+    },
+
+    /**
+     * Build posts from a reddit JSON listing
+     *
+     * @param  {Object} body
+     * @return {void}
+     */
+    handleJson (body) {
+        let posts = [];
+
+        if (typeof body.data === "undefined") {
+            this.sendError(['Invalid response body', body]);
+            return;
+        }
+
+        if (typeof body.data.children === "undefined") {
+            this.sendError('No posts returned. Ensure the subreddit name is spelled correctly. ' +
+                'Private subreddits are also inaccessible');
+            return;
+        }
+
+        body.data.children.forEach((post) => {
+            let temp = {};
+
+            temp.title = this.formatTitle(post.data.title);
+            temp.score = post.data.score;
+            temp.thumbnail = post.data.thumbnail;
+            temp.src = this.getImageUrl(post.data.preview, post.data.thumbnail),
+            temp.gilded = post.data.gilded;
+            temp.num_comments = post.data.num_comments;
+            temp.subreddit = post.data.subreddit;
+            temp.author = post.data.author;
+
+            // Skip image posts that do not have images
+            if (this.config.displayType !== 'image' || temp.src !== null) {
+                posts.push(temp);
             }
         });
+
+        this.sendData({posts: posts});
+    },
+
+    /**
+     * Build posts from a reddit Atom/RSS feed. The feed carries no score,
+     * comment count or gilding, so those fields are left blank.
+     *
+     * @param  {String} xml
+     * @return {void}
+     */
+    handleRss (xml) {
+        let entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) || [],
+            posts = [];
+
+        entries.slice(0, this.config.count).forEach((entry) => {
+            let pick = (regex) => { let m = entry.match(regex); return m ? this.decodeEntities(m[1]) : ''; },
+                thumbnail = pick(/<media:thumbnail url="([^"]+)"/),
+                image = pick(/&lt;a href=&quot;(https:\/\/i\.redd\.it\/[^&]+)&quot;/) ||
+                    pick(/<link href="(https:\/\/i\.redd\.it\/[^"]+)"/),
+                temp = {};
+
+            temp.title = this.formatTitle(pick(/<title>([\s\S]*?)<\/title>/));
+            temp.score = '';
+            temp.thumbnail = thumbnail || 'default';
+            temp.src = image || null;
+            temp.gilded = 0;
+            temp.num_comments = '';
+            temp.subreddit = pick(/<category term="([^"]+)"/);
+            temp.author = pick(/<author><name>\/u\/([^<]+)<\/name>/);
+
+            if (this.config.displayType !== 'image' || temp.src !== null) {
+                posts.push(temp);
+            }
+        });
+
+        if (posts.length === 0) {
+            this.sendError('No posts returned. Ensure the subreddit name is spelled correctly. ' +
+                'Private subreddits are also inaccessible');
+            return;
+        }
+
+        this.sendData({posts: posts});
+    },
+
+    /**
+     * Decode the XML/HTML entities reddit uses in feed text
+     *
+     * @param  {String} text
+     * @return {String}
+     */
+    decodeEntities (text) {
+        return text
+            .replace(/&#(\d+);/g, (m, code) => String.fromCharCode(code))
+            .replace(/&#x([0-9a-f]+);/gi, (m, code) => String.fromCharCode(parseInt(code, 16)))
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;|&apos;/g, "'")
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&');
     },
 
     /**
